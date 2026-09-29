@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+ <!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
@@ -9,7 +9,15 @@ body{margin:0;background:#111;color:#fff;font-family:system-ui,sans-serif;text-a
 #wrap{position:relative;width:min(96vw,720px);margin:12px auto}
 video,canvas{width:100%;border-radius:12px;transform:scaleX(-1)}
 canvas{position:absolute;left:0;top:0}
-button{font-size:18px;padding:12px 24px;margin:12px;border:0;border-radius:10px;background:#e53935;color:#fff}
+button{font-size:18px;padding:12px 24px;margin:12px;border:0;border-radius:10px;background:#e53935;color:#fff;cursor:pointer}
+#hud{font-size:20px;margin:8px}
+#count{font-size:48px;font-weight:bold}
+#feedback{min-height:40px;font-size:20px;font-weight:bold;color:#ffca28}
+#timer{font-size:16px;color:#aaa}
+#result{display:none;background:#1c1c1c;border-radius:12px;padding:20px;width:min(96vw,720px);margin:12px auto;text-align:left}
+#result h2{text-align:center}
+#result table{width:100%;border-collapse:collapse;margin-top:12px}
+#result td{padding:6px 0;border-bottom:1px solid #333}
 </style>
 </head>
 <body>
@@ -17,11 +25,38 @@ button{font-size:18px;padding:12px 24px;margin:12px;border:0;border-radius:10px;
 <button id="start">Включить камеру</button>
 <div id="status"></div>
 <div id="wrap"><video id="v" autoplay playsinline muted></video><canvas id="c"></canvas></div>
+
+<div id="hud">
+  Нажатий: <span id="count">0</span> / 30 &nbsp;|&nbsp; Темп: <span id="bpm">--</span> в мин
+  <div id="timer"></div>
+</div>
+<div id="feedback"></div>
+
+<div id="result">
+  <h2>Итог тренировки</h2>
+  <table>
+    <tr><td>Всего нажатий</td><td id="r_count"></td></tr>
+    <tr><td>Время тренировки</td><td id="r_time"></td></tr>
+    <tr><td>Темп в норме (100-120)</td><td id="r_rhythm"></td></tr>
+    <tr><td>Наклон — руки не над плечами</td><td id="r_vertical"></td></tr>
+    <tr><td>Работа только руками</td><td id="r_body"></td></tr>
+    <tr><td>Паузы дольше 2 сек</td><td id="r_pause"></td></tr>
+  </table>
+  <button id="restart">Пройти ещё раз</button>
+</div>
+
 <script type="module">
 import {PoseLandmarker, FilesetResolver, DrawingUtils} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
 const v=document.getElementById('v'), c=document.getElementById('c'), st=document.getElementById('status');
 const ctx=c.getContext('2d'), du=new DrawingUtils(ctx);
+const countEl=document.getElementById('count'), bpmEl=document.getElementById('bpm'), fbEl=document.getElementById('feedback');
+const timerEl=document.getElementById('timer'), resultEl=document.getElementById('result');
 let pose;
+
+const TARGET_COUNT = 30;      // цель: 30 нажатий
+const TIME_LIMIT_MS = 40000;  // страховка: не дольше 40 секунд
+
 document.getElementById('start').onclick=async()=>{
   try{
     st.textContent='Загрузка модели...';
@@ -33,16 +68,140 @@ document.getElementById('start').onclick=async()=>{
     await v.play();
     c.width=v.videoWidth; c.height=v.videoHeight;
     st.textContent='Камера работает';
+    startExercise();
     loop();
   }catch(e){ st.textContent='Ошибка: '+e.message; }
 };
+
+document.getElementById('restart').onclick=()=>{
+  resultEl.style.display='none';
+  startExercise();
+};
+
+let running=false;
+let startTime=0;
+let compressionCount=0;
+let lastCompressionTime=0;
+let direction=null;
+let lastWristY=null;
+let shoulderAmp=[], wristAmp=[];
+
+let framesTotal=0, framesRhythmOk=0;
+let errorCounts={vertical:0, body:0, pause:0};
+let lastErrorType=null;
+
+function startExercise(){
+  running=true;
+  startTime=performance.now();
+  compressionCount=0;
+  lastCompressionTime=0;
+  direction=null; lastWristY=null;
+  shoulderAmp=[]; wristAmp=[];
+  framesTotal=0; framesRhythmOk=0;
+  errorCounts={vertical:0, body:0, pause:0};
+  lastErrorType=null;
+  countEl.textContent='0';
+  bpmEl.textContent='--';
+  setFeedback('');
+}
+
+function setFeedback(text){ fbEl.textContent = text || ''; }
+
+function finishExercise(){
+  running=false;
+  setFeedback('Готово!');
+  const elapsedSec = Math.round((performance.now()-startTime)/1000);
+  document.getElementById('r_count').textContent = compressionCount + ' из ' + TARGET_COUNT;
+  document.getElementById('r_time').textContent = elapsedSec + ' сек';
+  const rhythmPct = framesTotal>0 ? Math.round(100*framesRhythmOk/framesTotal) : 0;
+  document.getElementById('r_rhythm').textContent = rhythmPct + '%';
+  document.getElementById('r_vertical').textContent = errorCounts.vertical + ' раз';
+  document.getElementById('r_body').textContent = errorCounts.body + ' раз';
+  document.getElementById('r_pause').textContent = errorCounts.pause + ' раз';
+  resultEl.style.display='block';
+}
+
 function loop(){
-  const res=pose.detectForVideo(v,performance.now());
+  const now = performance.now();
+  const res = pose.detectForVideo(v, now);
   ctx.clearRect(0,0,c.width,c.height);
-  for(const lm of res.landmarks){
-    du.drawConnectors(lm,PoseLandmarker.POSE_CONNECTIONS);
-    du.drawLandmarks(lm,{radius:3});
+
+  if(res.landmarks.length===0){
+    if(running) setFeedback('Встань так, чтобы тебя было видно целиком');
+    requestAnimationFrame(loop);
+    return;
   }
+
+  const lm = res.landmarks[0];
+  du.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS);
+  du.drawLandmarks(lm, {radius:3});
+
+  if(!running){ requestAnimationFrame(loop); return; }
+
+  const ls=lm[11], rs=lm[12], lw=lm[15], rw=lm[16];
+  if(!ls||!rs||!lw||!rw){ requestAnimationFrame(loop); return; }
+
+  const shoulderX=(ls.x+rs.x)/2, shoulderY=(ls.y+rs.y)/2;
+  const wristX=(lw.x+rw.x)/2, wristY=(lw.y+rw.y)/2;
+
+  shoulderAmp.push({t:now,y:shoulderY});
+  wristAmp.push({t:now,y:wristY});
+  shoulderAmp=shoulderAmp.filter(p=>now-p.t<1500);
+  wristAmp=wristAmp.filter(p=>now-p.t<1500);
+
+  if(lastWristY!==null){
+    const dy=wristY-lastWristY;
+    if(dy>0.003){ direction='down'; }
+    else if(dy<-0.003){
+      if(direction==='down'){
+        compressionCount++;
+        countEl.textContent=compressionCount;
+        const interval=now-lastCompressionTime;
+        if(lastCompressionTime>0 && interval>0) bpmEl.textContent=Math.round(60000/interval);
+        lastCompressionTime=now;
+      }
+      direction='up';
+    }
+  }
+  lastWristY=wristY;
+
+  let msg='', errType=null;
+  if(lastCompressionTime>0 && (now-lastCompressionTime)>2000){
+    msg='Не останавливайся! Качай без пауз, счёт идёт на секунды'; errType='pause';
+  } else if(Math.abs(shoulderX-wristX)>0.08){
+    msg='Навались над манекеном! Подай туловище вперёд, чтобы плечи были над руками'; errType='vertical';
+  } else if(shoulderAmp.length>5 && wristAmp.length>5){
+    const sMax=Math.max(...shoulderAmp.map(p=>p.y)), sMin=Math.min(...shoulderAmp.map(p=>p.y));
+    const wMax=Math.max(...wristAmp.map(p=>p.y)), wMin=Math.min(...wristAmp.map(p=>p.y));
+    const sRange=sMax-sMin, wRange=wMax-wMin;
+    if(wRange>0.02 && sRange/wRange<0.35){
+      msg='Включи в работу спину! Опускай всё туловище, а не только руки'; errType='body';
+    }
+  }
+
+  let rhythmOk=false;
+  if(!msg && bpmEl.textContent!=='--'){
+    const bpm=parseInt(bpmEl.textContent);
+    if(bpm<100){ msg='Ускорься, нужно 100-120 нажатий в минуту'; }
+    else if(bpm>120){ msg='Чуть медленнее, не быстрее 120 в минуту'; }
+    else { rhythmOk=true; }
+  }
+
+  framesTotal++;
+  if(rhythmOk) framesRhythmOk++;
+  if(errType && errType!==lastErrorType) errorCounts[errType]++;
+  lastErrorType=errType;
+
+  setFeedback(msg);
+
+  const elapsedMs = now-startTime;
+  const leftSec = Math.max(0, Math.ceil((TIME_LIMIT_MS-elapsedMs)/1000));
+  timerEl.textContent = 'Осталось времени: ' + leftSec + ' сек';
+
+  if(compressionCount>=TARGET_COUNT || elapsedMs>=TIME_LIMIT_MS){
+    finishExercise();
+  }
+
   requestAnimationFrame(loop);
 }
 </script>
